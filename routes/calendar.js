@@ -39,6 +39,9 @@ function fetchAndCacheFinnhubData() {
     resp.on('end', () => {
       try {
         const data = JSON.parse(body);
+        const dir = path.dirname(CACHE_FILE);
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        
         if (data && data.economicCalendar && data.economicCalendar.length > 0) {
           fs.writeFileSync(CACHE_FILE, JSON.stringify(data, null, 2), 'utf-8');
           console.log(`[Calendar Cache] Successfully saved ${data.economicCalendar.length} events to disk cache.`);
@@ -51,12 +54,16 @@ function fetchAndCacheFinnhubData() {
       } catch (parseErr) {
         console.error('[Calendar Cache] Failed to parse Finnhub JSON. Using mock fallback:', parseErr);
         const fallbackData = { economicCalendar: generateTodaysMockEvents() };
+        const dir = path.dirname(CACHE_FILE);
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
         fs.writeFileSync(CACHE_FILE, JSON.stringify(fallbackData, null, 2), 'utf-8');
       }
     });
   }).on('error', (err) => {
     console.error('[Calendar Cache] Network error fetching Finnhub data. Using mock fallback:', err);
     const fallbackData = { economicCalendar: generateTodaysMockEvents() };
+    const dir = path.dirname(CACHE_FILE);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(CACHE_FILE, JSON.stringify(fallbackData, null, 2), 'utf-8');
   });
 }
