@@ -16,7 +16,7 @@ const http = require('http');
 const { Server } = require('socket.io');
 
 const app = express();
-const PORT = 4000;
+const PORT = process.env.PORT || 4000;
 const server = http.createServer(app);
 
 // Initialize Socket.io with flexible CORS settings for local development and live domains
