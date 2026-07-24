@@ -6,13 +6,37 @@ const dotenv = require('dotenv');
 dotenv.config({ path: path.join(__dirname, '../.env') });
 
 const ALGORITHM = 'aes-256-gcm';
-const KEY_HEX = process.env.ENCRYPTION_KEY;
 
-if (!KEY_HEX || KEY_HEX.length !== 64) {
-  throw new Error('Invalid or missing ENCRYPTION_KEY in .env. Must be a 32-byte hex string (64 characters).');
+/**
+ * Resolves the vault key at call time rather than on import.
+ *
+ * Throwing during import took the whole server down — including routes that
+ * have nothing to do with the broker vault — so a missing key now fails only
+ * the operations that actually need it.
+ */
+function getEncryptionKey() {
+  const keyHex = process.env.ENCRYPTION_KEY;
+
+  if (!keyHex || keyHex.length !== 64 || !/^[0-9a-fA-F]+$/.test(keyHex)) {
+    throw new Error('Invalid or missing ENCRYPTION_KEY. Must be a 32-byte hex string (64 characters).');
+  }
+
+  return Buffer.from(keyHex, 'hex');
 }
 
-const ENCRYPTION_KEY = Buffer.from(KEY_HEX, 'hex');
+/** True when broker credential vaulting is usable, for callers that want to check first. */
+function isVaultConfigured() {
+  try {
+    getEncryptionKey();
+    return true;
+  } catch (err) {
+    return false;
+  }
+}
+
+if (!isVaultConfigured()) {
+  console.warn('[Crypto] ENCRYPTION_KEY is not configured — broker linking is disabled until it is set.');
+}
 
 /**
  * Encrypts cleartext using AES-256-GCM.
@@ -22,7 +46,7 @@ function encryptToken(text) {
   if (!text) return null;
   
   const iv = crypto.randomBytes(12); // GCM standard IV length is 12 bytes
-  const cipher = crypto.createCipheriv(ALGORITHM, ENCRYPTION_KEY, iv);
+  const cipher = crypto.createCipheriv(ALGORITHM, getEncryptionKey(), iv);
   
   let encrypted = cipher.update(text, 'utf8', 'hex');
   encrypted += cipher.final('hex');
@@ -47,7 +71,7 @@ function decryptToken(encryptedText) {
   const tag = Buffer.from(parts[1], 'hex');
   const encrypted = Buffer.from(parts[2], 'hex');
   
-  const decipher = crypto.createDecipheriv(ALGORITHM, ENCRYPTION_KEY, iv);
+  const decipher = crypto.createDecipheriv(ALGORITHM, getEncryptionKey(), iv);
   decipher.setAuthTag(tag);
   
   let decrypted = decipher.update(encrypted, 'hex', 'utf8');
@@ -58,5 +82,6 @@ function decryptToken(encryptedText) {
 
 module.exports = {
   encryptToken,
-  decryptToken
+  decryptToken,
+  isVaultConfigured
 };
