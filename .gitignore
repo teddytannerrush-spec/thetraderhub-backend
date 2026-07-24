@@ -1,0 +1,7 @@
+node_modules/
+.env
+.DS_Store
+
+# Runtime state — committing these resurrects stale data on every deploy
+charts_db.json
+data/economic_calendar.json

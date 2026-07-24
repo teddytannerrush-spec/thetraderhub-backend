@@ -3,7 +3,7 @@ const path = require('path');
 const dotenv = require('dotenv');
 
 // Ensure env is loaded from the server root
-dotenv.config({ path: path.join(__dirname, '../../.env') });
+dotenv.config({ path: path.join(__dirname, '../.env') });
 
 const ALGORITHM = 'aes-256-gcm';
 const KEY_HEX = process.env.ENCRYPTION_KEY;

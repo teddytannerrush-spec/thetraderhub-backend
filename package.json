@@ -2,9 +2,9 @@
   "name": "thetraderhub-backend",
   "version": "1.0.0",
   "description": "Secure broker verification backend for TheTraderHub",
-  "main": "src/server.js",
+  "main": "server.js",
   "scripts": {
-    "start": "node src/server.js"
+    "start": "node server.js"
   },
   "dependencies": {
     "cors": "^2.8.5",

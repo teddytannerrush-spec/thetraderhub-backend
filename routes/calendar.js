@@ -1,107 +1,156 @@
 const express = require('express');
 const https = require('https');
-const cron = require('node-cron');
-const fs = require('fs');
-const path = require('path');
 const router = express.Router();
 const { generateTodaysMockEvents } = require('../data/calendarMockData');
 
-const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY && process.env.FINNHUB_API_KEY !== 'your_finnhub_key_here'
-  ? process.env.FINNHUB_API_KEY
-  : 'd8hlko1r01qrn5ecqhegd8hlko1r01qrn5ecqhf0';
+// ForexFactory's weekly economic calendar, published as free JSON (no API key required).
+const FEED_URL = 'https://nfs.faireconomy.media/ff_calendar_thisweek.json';
 
-const CACHE_FILE = path.join(__dirname, '../data/economic_calendar.json');
+const CACHE_TTL_MS = 15 * 60 * 1000;      // live data is stable; refresh quarter-hourly
+const FALLBACK_TTL_MS = 2 * 60 * 1000;    // transient failure; retry sooner than that
+const RATE_LIMIT_TTL_MS = 20 * 60 * 1000; // the feed throttles hard, so back well off
+const STALE_MAX_AGE_MS = 24 * 60 * 60 * 1000; // serve last-known-good rather than mock
+
+let cachedPayload = null;
+let cacheExpiresAt = 0;
+let lastGoodEvents = null;
+let lastGoodAt = 0;
+
+// ForexFactory impact labels -> the levels the frontend filters on
+const IMPACT_MAP = {
+  high: 'high',
+  medium: 'medium',
+  low: 'low',
+  holiday: 'none'
+};
 
 /**
- * Fetches data from Finnhub and saves it to local cache file.
+ * ForexFactory sends offset-aware ISO dates ("2026-07-19T18:45:00-04:00").
+ * The frontend parses "YYYY-MM-DD HH:MM:SS" and appends "Z", so it needs UTC.
  */
-function fetchAndCacheFinnhubData() {
-  console.log('[Calendar Cache] Fetching fresh data from Finnhub...');
-  
-  const today = new Date();
-  const twoWeeksOut = new Date(today.getTime() + 14 * 24 * 3600 * 1000);
-  
-  const formatDate = (d) => {
-    const year = d.getUTCFullYear();
-    const month = String(d.getUTCMonth() + 1).padStart(2, '0');
-    const day = String(d.getUTCDate()).padStart(2, '0');
-    return `${year}-${month}-${day}`;
+function toUtcTimestamp(isoDate) {
+  const parsed = new Date(isoDate);
+  if (isNaN(parsed.getTime())) return null;
+  return parsed.toISOString().slice(0, 19).replace('T', ' ');
+}
+
+/** Feed values arrive as strings like "250M" or "-0.6%"; empty strings become null. */
+function cleanValue(value) {
+  if (value === undefined || value === null) return null;
+  const trimmed = String(value).trim();
+  return trimmed === '' ? null : trimmed;
+}
+
+/** Reshape feed entries into the schema economic-calendar.html already renders. */
+function normalizeEvents(events) {
+  return events
+    .map(item => ({
+      time: toUtcTimestamp(item.date),
+      // The feed's "country" is really the currency code (USD, GBP, NZD...),
+      // which is what the currency pills filter on.
+      country: item.country,
+      currency: item.country,
+      impact: IMPACT_MAP[String(item.impact || '').toLowerCase()] || 'low',
+      event: item.title,
+      actual: cleanValue(item.actual),
+      estimate: cleanValue(item.forecast),
+      previous: cleanValue(item.previous),
+      unit: ''
+    }))
+    .filter(event => event.time && event.event);
+}
+
+/** Mock events, clearly flagged so the UI can never present them as live data. */
+function buildFallbackPayload(reason) {
+  console.warn(`[Calendar] Serving sample data — ${reason}`);
+  return {
+    economicCalendar: generateTodaysMockEvents(),
+    source: 'sample',
+    live: false,
+    notice: 'Sample data — the live economic calendar feed is unavailable.',
+    fetchedAt: new Date().toISOString()
   };
+}
 
-  const fromDate = formatDate(today);
-  const toDate = formatDate(twoWeeksOut);
-
-  const url = `https://finnhub.io/api/v1/calendar/economic?from=${fromDate}&to=${toDate}&token=${FINNHUB_API_KEY}`;
-  
-  https.get(url, (resp) => {
-    let body = '';
-    resp.on('data', chunk => body += chunk);
-    resp.on('end', () => {
-      try {
-        const data = JSON.parse(body);
-        const dir = path.dirname(CACHE_FILE);
-        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-        
-        if (data && data.economicCalendar && data.economicCalendar.length > 0) {
-          fs.writeFileSync(CACHE_FILE, JSON.stringify(data, null, 2), 'utf-8');
-          console.log(`[Calendar Cache] Successfully saved ${data.economicCalendar.length} events to disk cache.`);
-        } else {
-          console.warn('[Calendar Cache] Received empty or invalid format from Finnhub. Using mock fallback.');
-          const fallbackData = { economicCalendar: generateTodaysMockEvents() };
-          fs.writeFileSync(CACHE_FILE, JSON.stringify(fallbackData, null, 2), 'utf-8');
-          console.log(`[Calendar Cache] Successfully saved ${fallbackData.economicCalendar.length} mock events to disk cache.`);
+function fetchCalendar() {
+  return new Promise((resolve, reject) => {
+    const request = https.get(
+      FEED_URL,
+      { headers: { 'User-Agent': 'TheTraderHub/1.0 (+https://thetraderhub.co.uk)' } },
+      response => {
+        if (response.statusCode !== 200) {
+          response.resume();
+          return reject(new Error(`feed returned HTTP ${response.statusCode}`));
         }
-      } catch (parseErr) {
-        console.error('[Calendar Cache] Failed to parse Finnhub JSON. Using mock fallback:', parseErr);
-        const fallbackData = { economicCalendar: generateTodaysMockEvents() };
-        const dir = path.dirname(CACHE_FILE);
-        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-        fs.writeFileSync(CACHE_FILE, JSON.stringify(fallbackData, null, 2), 'utf-8');
+
+        let body = '';
+        response.setEncoding('utf8');
+        response.on('data', chunk => { body += chunk; });
+        response.on('end', () => {
+          try {
+            const parsed = JSON.parse(body);
+            if (!Array.isArray(parsed) || parsed.length === 0) {
+              return reject(new Error('feed returned no events'));
+            }
+            const events = normalizeEvents(parsed);
+            if (events.length === 0) {
+              return reject(new Error('no usable events after normalizing'));
+            }
+            resolve(events);
+          } catch (err) {
+            reject(new Error(`could not parse feed: ${err.message}`));
+          }
+        });
       }
+    );
+
+    request.on('error', err => reject(new Error(`network error: ${err.message}`)));
+    request.setTimeout(10000, () => {
+      request.destroy();
+      reject(new Error('feed timed out after 10s'));
     });
-  }).on('error', (err) => {
-    console.error('[Calendar Cache] Network error fetching Finnhub data. Using mock fallback:', err);
-    const fallbackData = { economicCalendar: generateTodaysMockEvents() };
-    const dir = path.dirname(CACHE_FILE);
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(CACHE_FILE, JSON.stringify(fallbackData, null, 2), 'utf-8');
   });
 }
 
 // -----------------------------------------------------
 // GET /api/economic-calendar
 // -----------------------------------------------------
-router.get('/', (req, res) => {
-  // If the cache file exists, serve it directly
-  if (fs.existsSync(CACHE_FILE)) {
-    try {
-      const fileData = fs.readFileSync(CACHE_FILE, 'utf-8');
-      const jsonData = JSON.parse(fileData);
-      return res.json(jsonData);
-    } catch (err) {
-      console.error('[Calendar Cache] Error reading cache file:', err);
-      return res.status(500).json({ error: 'Failed to read cache file' });
+router.get('/', async (req, res) => {
+  if (cachedPayload && Date.now() < cacheExpiresAt) {
+    return res.json(cachedPayload);
+  }
+
+  try {
+    const events = await fetchCalendar();
+    lastGoodEvents = events;
+    lastGoodAt = Date.now();
+    cachedPayload = {
+      economicCalendar: events,
+      source: 'forexfactory',
+      live: true,
+      fetchedAt: new Date(lastGoodAt).toISOString()
+    };
+    cacheExpiresAt = Date.now() + CACHE_TTL_MS;
+    console.log(`[Calendar] Fetched ${events.length} live events.`);
+  } catch (err) {
+    // Real events that are a few hours old beat invented ones, so prefer
+    // last-known-good and only drop to mock once it is genuinely stale.
+    if (lastGoodEvents && Date.now() - lastGoodAt < STALE_MAX_AGE_MS) {
+      console.warn(`[Calendar] Serving last-known-good data — ${err.message}`);
+      cachedPayload = {
+        economicCalendar: lastGoodEvents,
+        source: 'forexfactory',
+        live: true,
+        stale: true,
+        fetchedAt: new Date(lastGoodAt).toISOString()
+      };
+    } else {
+      cachedPayload = buildFallbackPayload(err.message);
     }
-  } else {
-    // If no cache exists yet, fetch immediately in background and return empty 
-    fetchAndCacheFinnhubData();
-    return res.status(503).json({ error: 'Cache is warming up. Please try again shortly.' });
+    cacheExpiresAt = Date.now() + (/HTTP 429/.test(err.message) ? RATE_LIMIT_TTL_MS : FALLBACK_TTL_MS);
   }
+
+  return res.json(cachedPayload);
 });
-
-// Run the initial fetch 3 seconds after server boots to prime the cache
-setTimeout(() => {
-  if (!fs.existsSync(CACHE_FILE)) {
-    console.log('[Calendar Cache] Cache file missing. Priming cache...');
-    fetchAndCacheFinnhubData();
-  }
-}, 3000);
-
-// Schedule background fetch to run at minute 0 past every hour
-cron.schedule('0 * * * *', () => {
-  console.log('[Calendar Cache] ⏰ Hourly cron trigger — refreshing calendar data.');
-  fetchAndCacheFinnhubData();
-}, { timezone: 'UTC' });
-console.log('[Calendar Cache] Hourly caching cron registered.');
 
 module.exports = router;
