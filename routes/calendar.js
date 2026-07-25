@@ -63,8 +63,16 @@ function normalizeEvents(events) {
 /** Mock events, clearly flagged so the UI can never present them as live data. */
 function buildFallbackPayload(reason) {
   console.warn(`[Calendar] Serving sample data — ${reason}`);
+
+  // The frontend does not yet read the `source` flag, so mark the rows
+  // themselves. Nothing invented should ever be mistaken for a real release.
+  const labelled = generateTodaysMockEvents().map(event => ({
+    ...event,
+    event: `[SAMPLE] ${event.event}`
+  }));
+
   return {
-    economicCalendar: generateTodaysMockEvents(),
+    economicCalendar: labelled,
     source: 'sample',
     live: false,
     notice: 'Sample data — the live economic calendar feed is unavailable.',
