@@ -68,6 +68,8 @@ function buildFallbackPayload(reason) {
     source: 'sample',
     live: false,
     notice: 'Sample data — the live economic calendar feed is unavailable.',
+    // Surfaced so the failure is diagnosable without shell access to the host.
+    reason,
     fetchedAt: new Date().toISOString()
   };
 }
